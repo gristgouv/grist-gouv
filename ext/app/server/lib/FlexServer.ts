@@ -1,5 +1,5 @@
 // Start grist-gouv managed block
-import "instrument";
+import "./instrument";
 import * as Sentry from "@sentry/node";
 // End grist-gouv managed block
 

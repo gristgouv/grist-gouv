@@ -22,17 +22,17 @@ default:
 	@echo "  make docker"
 
 requirements:
-	test -e core && cd core && git fetch || git clone https://github.com/gristlabs/grist-core.git core 
-	cd ext && yarn install --frozen-lockfile --modules-folder=../node_modules --verbose
-	cd core && yarn install --frozen-lockfile --verbose
-	cd core && test -e ext && echo ext present || ln -s ../ext ext
-	cd core && yarn run install:python
+	test -e core || git clone https://github.com/gristlabs/grist-core.git core 
+	test -e core/ext && echo core/ext present || ln -s ../ext core/ext
+	yarn --cwd=ext install --frozen-lockfile --modules-folder=../node_modules
+	yarn --cwd=core install --frozen-lockfile
+	yarn --cwd=core run install:python
 
 build:
-	cd core && yarn run build
+	yarn --cwd=core run build
 
 start:
-	cd core && yarn start
+	yarn --cwd=core start
 
 docker:
 	docker buildx build --load -t gristlabs/grist-ee --build-context=ext=ext core

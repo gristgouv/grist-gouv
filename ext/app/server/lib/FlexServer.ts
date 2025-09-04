@@ -1,8 +1,3 @@
-// Start grist-gouv managed block
-import "./instrument";
-import * as Sentry from "@sentry/node";
-// End grist-gouv managed block
-
 import {ApiError} from 'app/common/ApiError';
 import {ICustomWidget} from 'app/common/CustomWidget';
 import {delay} from 'app/common/delay';
@@ -10,7 +5,7 @@ import {encodeUrl, getSlugIfNeeded, GristDeploymentType, GristDeploymentTypes,
         GristLoadConfig, IGristUrlState, isOrgInPathOnly, LatestVersionAvailable, parseSubdomain,
         sanitizePathTail} from 'app/common/gristUrls';
 import {getOrgUrlInfo} from 'app/common/gristUrls';
-import {isAffirmative, safeJsonParse} from 'app/common/gutil';
+import {isAffirmative} from 'app/common/gutil';
 import {UserProfile} from 'app/common/LoginSessionAPI';
 import {SandboxInfo} from 'app/common/SandboxInfo';
 import {tbind} from 'app/common/tbind';
@@ -38,14 +33,16 @@ import {
   getConfiguredAttachmentStoreConfigs,
   IAttachmentStoreProvider
 } from 'app/server/lib/AttachmentStoreProvider';
-import {addRequestUser, getTransitiveHeaders, getUser, getUserId, isAnonymousUser,
+import {addRequestUser, getUser, getUserId, isAnonymousUser,
         isSingleUserMode, redirectToLoginUnconditionally} from 'app/server/lib/Authorizer';
 import {redirectToLogin, RequestWithLogin, signInStatusMiddleware} from 'app/server/lib/Authorizer';
 import {forceSessionChange} from 'app/server/lib/BrowserSession';
 import {Comm} from 'app/server/lib/Comm';
 import {ConfigBackendAPI} from 'app/server/lib/ConfigBackendAPI';
 import {IGristCoreConfig} from 'app/server/lib/configCore';
+import {getAndClearSignupStateCookie} from 'app/server/lib/cookieUtils';
 import {create} from 'app/server/lib/create';
+import {createSavedDoc} from 'app/server/lib/createSavedDoc';
 import {addDiscourseConnectEndpoints} from 'app/server/lib/DiscourseConnect';
 import {addDocApiRoutes} from 'app/server/lib/DocApi';
 import {DocManager} from 'app/server/lib/DocManager';
@@ -56,28 +53,30 @@ import {DocWorkerInfo, IDocWorkerMap} from 'app/server/lib/DocWorkerMap';
 import {expressWrap, jsonErrorHandler, secureJsonErrorHandler} from 'app/server/lib/expressWrap';
 import {Hosts, RequestWithOrg} from 'app/server/lib/extractOrg';
 import {addGoogleAuthEndpoint} from 'app/server/lib/GoogleAuth';
-import {createGristJobs, GristBullMQJobs, GristJobs} from 'app/server/lib/GristJobs';
+import {createGristJobs, GristJobs} from 'app/server/lib/GristJobs';
 import {DocTemplate, GristLoginMiddleware, GristLoginSystem, GristServer,
   RequestWithGrist} from 'app/server/lib/GristServer';
 import {initGristSessions, SessionStore} from 'app/server/lib/gristSessions';
 import {IAssistant} from 'app/server/lib/IAssistant';
 import {IAuditLogger} from 'app/server/lib/IAuditLogger';
 import {IBilling} from 'app/server/lib/IBilling';
+import {IDocNotificationManager} from 'app/server/lib/IDocNotificationManager';
 import {IDocStorageManager} from 'app/server/lib/IDocStorageManager';
 import {EmptyNotifier, INotifier, TestSendGridExtensions} from 'app/server/lib/INotifier';
 import {InstallAdmin} from 'app/server/lib/InstallAdmin';
-import log from 'app/server/lib/log';
+import log, {logAsJson} from 'app/server/lib/log';
 import {IPermitStore} from 'app/server/lib/Permit';
 import {getAppPathTo, getAppRoot, getInstanceRoot, getUnpackedAppRoot} from 'app/server/lib/places';
 import {addPluginEndpoints, limitToPlugins} from 'app/server/lib/PluginEndpoint';
 import {PluginManager} from 'app/server/lib/PluginManager';
 import * as ProcessMonitor from 'app/server/lib/ProcessMonitor';
+import { createPubSubManager, IPubSubManager } from 'app/server/lib/PubSubManager';
 import {adaptServerUrl, getOrgUrl, getOriginUrl, getScope, integerParam, isParameterOn, optIntegerParam,
         optStringParam, RequestWithGristInfo, stringArrayParam, stringParam, TEST_HTTPS_OFFSET,
         trustOrigin} from 'app/server/lib/requestUtils';
 import {buildScimRouter} from 'app/server/lib/scim';
 import {ISendAppPageOptions, makeGristConfig, makeMessagePage, makeSendAppPage} from 'app/server/lib/sendAppPage';
-import {getDatabaseUrl, getPubSubPrefix, listenPromise, timeoutReached} from 'app/server/lib/serverUtils';
+import {getDatabaseUrl, listenPromise, timeoutReached} from 'app/server/lib/serverUtils';
 import {Sessions} from 'app/server/lib/Sessions';
 import * as shutdown from 'app/server/lib/shutdown';
 import {TagChecker} from 'app/server/lib/TagChecker';
@@ -89,7 +88,6 @@ import {addUploadRoute} from 'app/server/lib/uploads';
 import {buildWidgetRepository, getWidgetsInPlugins, IWidgetRepository} from 'app/server/lib/WidgetRepository';
 import {setupLocale} from 'app/server/localization';
 import axios from 'axios';
-import * as cookie from 'cookie';
 import EventEmitter from 'events';
 import express from 'express';
 import * as fse from 'fs-extra';
@@ -103,7 +101,6 @@ import morganLogger from 'morgan';
 import {AddressInfo} from 'net';
 import fetch from 'node-fetch';
 import * as path from 'path';
-import {createClient, RedisClient} from 'redis';
 import * as serveStatic from 'serve-static';
 
 // Health checks are a little noisy in the logs, so we don't show them all.
@@ -115,6 +112,9 @@ const HEALTH_CHECK_LOG_SHOW_EVERY_N = 100;
 // DocID of Grist doc to collect the Welcome questionnaire responses, such
 // as "GristNewUserInfo".
 const DOC_ID_NEW_USER_INFO = process.env.DOC_ID_NEW_USER_INFO;
+
+// PubSub channel we use to inform all servers when a new available Grist version is detected.
+const latestVersionChannel = 'latestVersionAvailable';
 
 export interface FlexServerOptions {
   dataDir?: string;
@@ -175,6 +175,8 @@ export class FlexServer implements GristServer {
   private _docWorkerLoadTracker?: DocWorkerLoadTracker;
   private _widgetRepository: IWidgetRepository;
   private _notifier: INotifier;
+  private _docNotificationManager: IDocNotificationManager|undefined|false = false;
+  private _pubSubManager: IPubSubManager = createPubSubManager(process.env.REDIS_URL);
   private _assistant?: IAssistant;
   private _accessTokens: IAccessTokens;
   private _internalPermitStore: IPermitStore;  // store for permits that stay within our servers
@@ -212,7 +214,6 @@ export class FlexServer implements GristServer {
   private _emitNotifier = new EmitNotifier();
   private _testPendingNotifications: number = 0;
   private _latestVersionAvailable?: LatestVersionAvailable;
-  private _redisSubscriptionClient?: RedisClient|null;
 
   constructor(public port: number, public name: string = 'flexServer',
               public readonly options: FlexServerOptions = {}) {
@@ -267,10 +268,12 @@ export class FlexServer implements GristServer {
     this.info.push(['defaultBaseDomain', this._defaultBaseDomain]);
     this._pluginUrl = options.pluginUrl || process.env.APP_UNTRUSTED_URL;
 
-    if (process.env.REDIS_URL) {
-      this._redisSubscriptionClient = createClient(process.env.REDIS_URL);
-      this._subscribeToVersionUpdates();
-    }
+    // We don't bother unsubscribing because that's automatic when we close this._pubSubManager.
+    void this.getPubSubManager().subscribe(latestVersionChannel, (message) => {
+      const latestVersionAvailable: LatestVersionAvailable = JSON.parse(message);
+      log.debug('FlexServer: setting latest version', latestVersionAvailable);
+      this.setLatestVersionAvailable(latestVersionAvailable);
+    });
 
     // The electron build is not supported at this time, but this stub
     // implementation of electronServerMethods is present to allow kicking
@@ -298,15 +301,6 @@ export class FlexServer implements GristServer {
       (req as RequestWithGrist).gristServer = this;
       next();
     });
-    
-    // Start grist-gouv managed block
-    this.app.get("/prout1", (req, res, next)=>{
-       res.send({
-         "msg": "manu habite là"
-       });
-     });
-     Sentry.setupExpressErrorHandler(this.app);
-     // END grist-gouv managed block
   }
 
   public getHost(): string {
@@ -385,15 +379,6 @@ export class FlexServer implements GristServer {
    */
   public getJobs(): GristJobs {
     return this._jobs || (this._jobs = createGristJobs());
-  }
-
-  /**
-   * Return the GristBullMQJobs instance if that's what we are using for jobs. Fail otherwise.
-   */
-  public getBullMQJobs(): GristBullMQJobs {
-    const jobs = this.getJobs();
-    if (jobs instanceof GristBullMQJobs) { return jobs; }
-    throw new Error("No full-featured job queues because Redis is unavailable");
   }
 
   /**
@@ -479,6 +464,19 @@ export class FlexServer implements GristServer {
     return this._emitNotifier;
   }
 
+  public getDocNotificationManager(): IDocNotificationManager|undefined {
+    if (this._docNotificationManager === false) {
+      // The special value of 'false' is used to create only on first call. Afterwards,
+      // the value may be undefined, but no longer false.
+      this._docNotificationManager = this.create.createDocNotificationManager(this);
+    }
+    return this._docNotificationManager;
+  }
+
+  public getPubSubManager(): IPubSubManager {
+    return this._pubSubManager;
+  }
+
   public getAssistant(): IAssistant | undefined {
     return this._assistant;
   }
@@ -546,7 +544,7 @@ export class FlexServer implements GristServer {
         altSessionId: req.altSessionId,
       });
     }
-    this.app.use(morganLogger(process.env.GRIST_HOSTED_VERSION ? outputJson : msg, {
+    this.app.use(morganLogger(logAsJson ? outputJson : msg, {
       skip: this._shouldSkipRequestLogging.bind(this)
     }));
   }
@@ -561,6 +559,11 @@ export class FlexServer implements GristServer {
     // If docWorkerRegistered=1 query parameter is included, status will include the status of the
     // doc worker registration in Redis.
     this.app.get('/status(/hooks)?', async (req, res) => {
+      log.rawDebug(`Healthcheck[${req.method}]:`, {
+        host: req.get('host'),
+        path: req.path,
+        query: req.query,
+      });
       const checks = new Map<string, Promise<boolean>|boolean>();
       const timeout = optIntegerParam(req.query.timeout, 'timeout') || 10_000;
 
@@ -868,7 +871,7 @@ export class FlexServer implements GristServer {
 
   public async initHomeDBManager() {
     if (this._check('homedb')) { return; }
-    this._dbManager = new HomeDBManager(this, this._emitNotifier);
+    this._dbManager = new HomeDBManager(this, this._emitNotifier, this._pubSubManager);
     this._dbManager.setPrefix(process.env.GRIST_ID_PREFIX || "");
     await this._dbManager.connect();
     await this._dbManager.initializeSpecialIds();
@@ -967,12 +970,18 @@ export class FlexServer implements GristServer {
     this.app.use('/api', jsonErrorHandler);
   }
 
+  public addWidgetRepository() {
+    if (this._check('widgets')) { return; }
+
+    this._widgetRepository = buildWidgetRepository(this);
+  }
+
   public addHomeApi() {
     if (this._check('api', 'homedb', 'json', 'api-mw')) { return; }
 
     // ApiServer's constructor adds endpoints to the app.
     // tslint:disable-next-line:no-unused-expression
-    new ApiServer(this, this.app, this._dbManager, this._widgetRepository = buildWidgetRepository(this));
+    new ApiServer(this, this.app, this._dbManager);
   }
 
   public addScimApi() {
@@ -1046,9 +1055,7 @@ export class FlexServer implements GristServer {
     if (this.usage)  { await this.usage.close(); }
     if (this._hosts) { this._hosts.close(); }
     this._emitNotifier.removeAllListeners();
-    if (this._dbManager) {
-      this._dbManager.flushDocAuthCache();
-    }
+    this._dbManager?.clearCaches();
     if (this.server)      { this.server.close(); }
     if (this.httpsServer) { this.httpsServer.close(); }
     if (this.housekeeper) { await this.housekeeper.stop(); }
@@ -1060,7 +1067,7 @@ export class FlexServer implements GristServer {
     if (this._sessionStore) { await this._sessionStore.close(); }
     if (this._auditLogger) { await this._auditLogger.close(); }
     if (this._billing) { await this._billing.close?.(); }
-    if (this._redisSubscriptionClient) { await this._redisSubscriptionClient.quitAsync(); }
+    await this._pubSubManager.close();
   }
 
   public addDocApiForwarder() {
@@ -1199,6 +1206,20 @@ export class FlexServer implements GristServer {
 
           // Give a chance to the login system to react to the first visit after signup.
           this._loginMiddleware.onFirstVisit?.(req);
+
+          // If the assistant needs to perform some work (e.g. redirect to a new document with a
+          // particular prompt pre-filled), do it now.
+          //
+          // TODO: break out this and other parts of `welcomeNewUser` into separate Express middleware.
+          // `onFirstVisit` may send a response, which is why we awkwardly check `headersSent` wasn't
+          // set before resuming the current middleware. This wouldn't be necessary if `onFirstVisit`
+          // was a proper Express middleware that called `next` when not sending a response.
+          if (this._assistant?.version === 2 && this._assistant.onFirstVisit) {
+            await this._assistant.onFirstVisit(req, res);
+            if (res.headersSent) {
+              return;
+            }
+          }
 
           // If we need to copy an unsaved document or template as part of sign-up, do so now
           // and redirect to it.
@@ -1548,8 +1569,6 @@ export class FlexServer implements GristServer {
         server: this,
         docId: 'test',  // The id is just used in logging - no
                         // document is created or read at this level.
-        // In olden times, and in SaaS, Python 2 is supported. In modern
-        // times Python 2 is long since deprecated and defunct.
         preferredPythonVersion: '3',
       });
       info.flavor = sandbox.getFlavor();
@@ -1582,6 +1601,15 @@ export class FlexServer implements GristServer {
     this._disableExternalStorage = true;
   }
 
+  public async getDoomTool() {
+    const dbManager = this.getHomeDBManager();
+    const permitStore = this.getPermitStore();
+    const notifier = this.getNotifier();
+    const loginSystem = await this.resolveLoginSystem();
+    const homeUrl = this.getHomeInternalUrl().replace(/\/$/, '');
+    return new Doom(dbManager, permitStore, notifier, loginSystem, homeUrl);
+  }
+
   public addAccountPage() {
     const middleware = [
       this._redirectToHostMiddleware,
@@ -1592,15 +1620,6 @@ export class FlexServer implements GristServer {
     this.app.get('/account', ...middleware, expressWrap(async (req, resp) => {
       return this._sendAppPage(req, resp, {path: 'app.html', status: 200, config: {}});
     }));
-
-    const createDoom = async () => {
-      const dbManager = this.getHomeDBManager();
-      const permitStore = this.getPermitStore();
-      const notifier = this.getNotifier();
-      const loginSystem = await this.resolveLoginSystem();
-      const homeUrl = this.getHomeInternalUrl().replace(/\/$/, '');
-      return new Doom(dbManager, permitStore, notifier, loginSystem, homeUrl);
-    };
 
     if (isAffirmative(process.env.GRIST_ACCOUNT_CLOSE)) {
       this.app.delete('/api/doom/account', expressWrap(async (req, resp) => {
@@ -1622,7 +1641,7 @@ export class FlexServer implements GristServer {
 
         // Reuse Doom cli tool for account deletion. It won't allow to delete account if it has access
         // to other (not public) team sites.
-        const doom = await createDoom();
+        const doom = await this.getDoomTool();
         const {data} = await doom.deleteUser(userId);
         if (data) { this._logDeleteUserEvents(req as RequestWithLogin, data); }
         return resp.status(200).json(true);
@@ -1656,7 +1675,7 @@ export class FlexServer implements GristServer {
 
         // Reuse Doom cli tool for org deletion. Note, this removes everything as a super user.
         const deletedOrg = structuredClone(org);
-        const doom = await createDoom();
+        const doom = await this.getDoomTool();
         await doom.deleteOrg(org.id);
         this._logDeleteSiteEvents(mreq, deletedOrg);
         return resp.status(200).send();
@@ -1886,8 +1905,13 @@ export class FlexServer implements GristServer {
     }
   }
 
-  public ready() {
-    this._isReady = true;
+  public setReady(value: boolean) {
+    if(value) {
+      log.debug('FlexServer is ready');
+    } else {
+      log.debug('FlexServer is no longer ready');
+    }
+    this._isReady = value;
   }
 
   public checkOptionCombinations() {
@@ -1938,11 +1962,17 @@ export class FlexServer implements GristServer {
       });
     }
     this._emitNotifier.sendGridExtensions = this._notifier.testSendGridExtensions?.();
+
+    // For doc notifications, if we are a home server, initialize endpoints and job handling.
+    this.getDocNotificationManager()?.initHomeServer(this.app);
   }
 
   public addAssistant() {
     if (this._check('assistant')) { return; }
-    this._assistant = this.create.Assistant();
+    this._assistant = this.create.Assistant(this);
+    if (this._assistant?.version === 2) {
+      this._assistant?.addEndpoints?.(this.app);
+    }
   }
 
   // for test purposes, check if any notifications are in progress
@@ -2072,20 +2102,10 @@ export class FlexServer implements GristServer {
   public async publishLatestVersionAvailable(latestVersionAvailable: LatestVersionAvailable): Promise<void> {
     log.info(`Publishing ${latestVersionAvailable.version} as the latest available version`);
 
-    if (process.env.REDIS_URL) {
-      const client = createClient(process.env.REDIS_URL);
-      const prefix = getPubSubPrefix();
-      const channel = `${prefix}-latestVersionAvailable`;
-      try {
-        await client.publishAsync(channel, JSON.stringify(latestVersionAvailable));
-      } catch(error) {
-        log.error(`Error publishing latest version`, {error, latestVersionAvailable});
-      } finally {
-        await client.quitAsync();
-      }
-    } else {
-      // No Redis, so let's assume this is a single-server setup and skip pub/sub
-      this.setLatestVersionAvailable(latestVersionAvailable);
+    try {
+      await this.getPubSubManager().publish(latestVersionChannel, JSON.stringify(latestVersionAvailable));
+    } catch(error) {
+      log.error(`Error publishing latest version`, {error, latestVersionAvailable});
     }
   }
 
@@ -2154,6 +2174,43 @@ export class FlexServer implements GristServer {
 
   public onStreamingDestinationsChange(callback: (orgId?: number) => Promise<void>) {
     this._emitNotifier.on('streamingDestinationsChange', callback);
+  }
+
+  public async getSigninUrl(
+    req: express.Request,
+    options: {
+      signUp?: boolean;
+      nextUrl?: URL;
+      params?: Record<string, string | undefined>;
+    }
+  ) {
+    let {nextUrl, signUp} = options;
+    const {params = {}} = options;
+
+    const mreq = req as RequestWithLogin;
+
+    // This will ensure that express-session will set our cookie if it hasn't already -
+    // we'll need it when we redirect back.
+    forceSessionChange(mreq.session);
+
+    // Redirect to the requested URL after successful login.
+    if (!nextUrl) {
+      const nextPath = optStringParam(req.query.next, 'next');
+      nextUrl = new URL(getOrgUrl(req, nextPath));
+    }
+    if (signUp === undefined) {
+      // Like redirectToLogin in Authorizer, redirect to sign up if it doesn't look like the
+      // user has ever logged in on this browser.
+      signUp = (mreq.session.users === undefined);
+    }
+    const getRedirectUrl = signUp ? this._getSignUpRedirectUrl : this._getLoginRedirectUrl;
+    const url = new URL(await getRedirectUrl(req, nextUrl));
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined) {
+        url.searchParams.set(key, value);
+      }
+    }
+    return url.href;
   }
 
   // Adds endpoints that support imports and exports.
@@ -2422,23 +2479,6 @@ export class FlexServer implements GristServer {
     return false;
   }
 
-  private _subscribeToVersionUpdates() {
-    // If we have a Redis client, subscribe it to get version updates
-    if (this._redisSubscriptionClient) {
-      const prefix = getPubSubPrefix();
-      const channel = `${prefix}-latestVersionAvailable`;
-      this._redisSubscriptionClient.subscribe(channel);
-      this._redisSubscriptionClient.on("message", async (_, message) => {
-        const latestVersionAvailable: LatestVersionAvailable = JSON.parse(message);
-        log.debug('subscribeToVersionUpdates: setting latest version', latestVersionAvailable);
-        this.setLatestVersionAvailable(latestVersionAvailable);
-      });
-      this._redisSubscriptionClient.on("error", async (error) => {
-        log.warn('subscribeToVersionUpdates: redis client error', error);
-      });
-    }
-  }
-
   private _createServers() {
     // Start the app.
     const server = configServer(http.createServer(this.app));
@@ -2524,29 +2564,14 @@ export class FlexServer implements GristServer {
    */
   private async _redirectToLoginOrSignup(
     options: {
-      signUp?: boolean, nextUrl?: URL,
+      signUp?: boolean;
+      nextUrl?: URL;
+      params?: Record<string, string | undefined>;
     },
     req: express.Request, resp: express.Response,
   ) {
-    let {nextUrl, signUp} = options;
-
-    const mreq = req as RequestWithLogin;
-
-    // This will ensure that express-session will set our cookie if it hasn't already -
-    // we'll need it when we redirect back.
-    forceSessionChange(mreq.session);
-    // Redirect to the requested URL after successful login.
-    if (!nextUrl) {
-      const nextPath = optStringParam(req.query.next, 'next');
-      nextUrl = new URL(getOrgUrl(req, nextPath));
-    }
-    if (signUp === undefined) {
-      // Like redirectToLogin in Authorizer, redirect to sign up if it doesn't look like the
-      // user has ever logged in on this browser.
-      signUp = (mreq.session.users === undefined);
-    }
-    const getRedirectUrl = signUp ? this._getSignUpRedirectUrl : this._getLoginRedirectUrl;
-    resp.redirect(await getRedirectUrl(req, nextUrl));
+    const url = await this.getSigninUrl(req, options);
+    resp.redirect(url);
   }
 
   private async _redirectToHomeOrWelcomePage(
@@ -2579,54 +2604,21 @@ export class FlexServer implements GristServer {
     req: RequestWithLogin,
     resp: express.Response
   ): Promise<string|null> {
-    const cookies = cookie.parse(req.headers.cookie || '');
-    if (!cookies) { return null; }
+    const state = getAndClearSignupStateCookie(req, resp);
+    if (!state) {
+      return null;
+    }
 
-    const stateCookie = cookies['gr_signup_state'];
-    if (!stateCookie) { return null; }
-
-    const state = safeJsonParse(stateCookie, {});
     const {srcDocId} = state;
     if (!srcDocId) { return null; }
 
     let newDocId: string | null = null;
     try {
-      newDocId = await this._copyDocToHomeWorkspace(req, srcDocId);
+      newDocId = await createSavedDoc(this, req, {srcDocId});
     } catch (e) {
       log.error(`FlexServer failed to copy doc ${srcDocId} to Home workspace`, e);
-    } finally {
-      resp.clearCookie('gr_signup_state');
     }
     return newDocId;
-  }
-
-  private async _copyDocToHomeWorkspace(
-    req: express.Request,
-    docId: string,
-  ): Promise<string> {
-    const userId = getUserId(req);
-    const doc = await this._dbManager.getDoc({userId, urlId: docId});
-    if (!doc) { throw new Error(`Doc ${docId} not found`); }
-
-    const workspacesQueryResult = await this._dbManager.getOrgWorkspaces(getScope(req), 0);
-    const workspaces = this._dbManager.unwrapQueryResult(workspacesQueryResult);
-    const workspace = workspaces.find(w => w.name === 'Home');
-    if (!workspace) { throw new Error('Home workspace not found'); }
-
-    const copyDocUrl = this.getHomeInternalUrl('/api/docs');
-    const response = await fetch(copyDocUrl, {
-      headers: {
-        ...getTransitiveHeaders(req, { includeOrigin: false }),
-        'Content-Type': 'application/json',
-      },
-      method: 'POST',
-      body: JSON.stringify({
-        sourceDocumentId: doc.id,
-        workspaceId: workspace.id,
-        documentName: doc.name,
-      }),
-    });
-    return await response.json();
   }
 
   /**
@@ -2824,6 +2816,7 @@ export class EmitNotifier extends EventEmitter implements INotifier {
   public scheduledCall = this._wrapEvent('scheduledCall');
   public streamingDestinationsChange = this._wrapEvent('streamingDestinationsChange');
   public twoFactorStatusChanged = this._wrapEvent('twoFactorStatusChanged');
+  public docNotification = this._wrapEvent('docNotification');
 
   // Pass on deleteUser in the same way
   public deleteUser = this._wrapEvent('deleteUser');

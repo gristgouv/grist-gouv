@@ -1,15 +1,29 @@
 {
   "extends": "../../../buildtools/tsconfig-base-ext.json",
+  "references": [
+    { "path": "../../../app/common" },
+  ],
   "include": [
     "**/*",
     "../../../app/server/**/*",
     "../../../app/gen-server/**/*",
-    "../../../app/common/**/*",
     "../../../stubs/app/server/**/*",
-    "../../../stubs/app/common/**/*",
-    "../../../app/plugin/**/*",
   ],
-  "references": [
-    {},
-  ]
+  "exclude": [
+    // Every file that has an override in ext/ must be excluded here,
+    // otherwise TypeScript will complain about duplicate identifiers.
+    "../../../app/server/lib/FlexServer.ts",
+    "../../../app/server/lib/TestingHooks.ts",
+  ],
+  "compilerOptions": {
+    "paths": {
+      "*": [
+        // Very important that "ext/*" comes before "*" here, otherwise
+        // TypeScript will resolve to the non-ext version first and break everything.
+        "ext/*",
+        "*",
+        "stubs/*",
+      ],
+    }
+  },
 }
